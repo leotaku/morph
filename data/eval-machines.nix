@@ -5,55 +5,84 @@ let
   network = import networkExpr;
   pkgs    = network.network.pkgs;
   lib     = pkgs.lib;
+
+  importMachine = machineName: let
+    machine = network."${machineName}";
+
+    path =
+      if (!builtins.isFunction machine)
+      && (lib.hasAttr "nixpkgs" machine)
+      then machine.nixpkgs
+      else pkgs.path;
+
+    configuration =
+      if builtins.isFunction machine
+      then machine
+      else machine.configuration;
+
+    # Get the configuration of this machine from each network
+    # expression, attaching _file attributes so the NixOS module
+    # system can give sensible error messages.
+    modules = [
+      { imports = [ configuration ]; }
+      { inherit (network) _file; }
+    ];
+
+    __nixPath = [
+      {
+        prefix = "nixpkgs";
+        path = path;
+      }
+    ];
+
+    cleanImport = builtins.scopedImport {
+      inherit __nixPath;
+    };
+
+  in {
+    name = machineName;
+    value = cleanImport <nixpkgs/nixos/lib/eval-config.nix> {
+      modules = modules ++ [
+        ({ config, lib, options, ... }: {
+          key = "deploy-stuff";
+          imports = [ ./options.nix ];
+          # to the attribute name of the machine in the model.
+          networking.hostName = lib.mkDefault machineName;
+          deployment.targetHost = lib.mkDefault machineName;
+
+          # Apply network-level nixpkgs arguments as a baseline for
+          # per-machine nixpkgs arguments; mkDefault'ed so they
+          # can be overridden from within each machine
+          nixpkgs.overlays = lib.mkDefault pkgs.overlays;
+          nixpkgs.pkgs = lib.mkDefault (import path ({
+            inherit (config.nixpkgs) localSystem;
+            # Merge nixpkgs.config using its merge function
+            config = options.nixpkgs.config.type.merge ""
+            ([ { value = pkgs.config; } options.nixpkgs.config ]);
+          } // lib.optionalAttrs (config.nixpkgs.localSystem != config.nixpkgs.crossSystem) {
+            # Only override crossSystem if it is not equivalent to
+            # localSystem; works around issue #68
+            inherit (config.nixpkgs) crossSystem;
+          }));
+        })
+      ];
+      extraArgs = {
+        name = machineName;
+      };
+    };
+  };
+
 in
   with pkgs;
   with lib;
 
 rec {
   # Compute the definitions of the machines.
-  nodes =
-    listToAttrs (map (machineName:
-      let
-        # Get the configuration of this machine from each network
-        # expression, attaching _file attributes so the NixOS module
-        # system can give sensible error messages.
-        modules = [ { imports = [ network.${machineName} ]; } { inherit (network) _file; } ];
-      in
-      { name = machineName;
-        value = import "${toString pkgs.path}/nixos/lib/eval-config.nix" {
-          modules =
-            modules ++
-            [ ({ config, lib, options, ... }: {
-                key = "deploy-stuff";
-                imports = [ ./options.nix ];
-                # Provide a default hostname and deployment target equal
-                # to the attribute name of the machine in the model.
-                networking.hostName = lib.mkDefault machineName;
-                deployment.targetHost = lib.mkDefault machineName;
-
-                # Apply network-level nixpkgs arguments as a baseline for
-                # per-machine nixpkgs arguments; mkDefault'ed so they
-                # can be overridden from within each machine
-                nixpkgs.localSystem = lib.mkDefault pkgs.buildPlatform;
-                nixpkgs.crossSystem = lib.mkDefault pkgs.hostPlatform;
-                nixpkgs.overlays = lib.mkDefault pkgs.overlays;
-                nixpkgs.pkgs = lib.mkDefault (import pkgs.path ({
-                  inherit (config.nixpkgs) localSystem;
-                  # Merge nixpkgs.config using its merge function
-                  config = options.nixpkgs.config.type.merge ""
-                    ([ { value = pkgs.config; } options.nixpkgs.config ]);
-                } // lib.optionalAttrs (config.nixpkgs.localSystem != config.nixpkgs.crossSystem) {
-                  # Only override crossSystem if it is not equivalent to
-                  # localSystem; works around issue #68
-                  inherit (config.nixpkgs) crossSystem;
-                }));
-              })
-            ];
-          extraArgs = { inherit nodes ; name = machineName; };
-        };
-      }
-    ) (attrNames (removeAttrs network [ "network" "defaults" "resources" "require" "_file" ])));
-
+  nodes = listToAttrs (
+    map importMachine (attrNames (
+      removeAttrs network [ "network" "defaults" "resources" "require" "_file" ])
+    )
+  );
 
   deploymentInfoModule = {
     deployment = {
